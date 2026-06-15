@@ -44,12 +44,42 @@ function observeClockSkew(headers: Record<string, string> | undefined) {
   clockSkewMs = serverTime - Date.now()
 }
 
+// Server timezone offset in HOURS (positive = server is ahead of UTC) for
+// parsing rate-limit reset timestamps from response bodies. Most providers
+// (OpenAI, Anthropic, etc.) report reset times in UTC, but some custom
+// providers (e.g. MiniMax-M3 reports in their own local timezone, which
+// is UTC+8) do not. Without knowing the server's timezone, the naive
+// parse treats the body time as UTC and produces waits that are off by
+// the server's UTC offset (e.g. 8h too long for a UTC+8 server — and
+// notably, can exceed the actual rate-limit window, which is a logical
+// impossibility that surfaces as a debugging red flag). Set via env var:
+//
+//   $env:OPENCODE_RATE_LIMIT_TZ_OFFSET_HOURS = "8"   # for UTC+8 providers
+//   $env:OPENCODE_RATE_LIMIT_TZ_OFFSET_HOURS = "-5"  # for UTC-5
+//   $env:OPENCODE_RATE_LIMIT_TZ_OFFSET_HOURS = "0"   # for UTC (default)
+//
+// Fractional hours are supported (e.g. "5.5" for UTC+5:30 India).
+const rateLimitTzOffsetHours = (() => {
+  const env = process.env["OPENCODE_RATE_LIMIT_TZ_OFFSET_HOURS"]
+  if (!env) return 0
+  const parsed = Number.parseFloat(env)
+  return Number.isFinite(parsed) ? parsed : 0
+})()
+
+function formatTzOffset(hours: number): string {
+  const sign = hours >= 0 ? "+" : "-"
+  const abs = Math.abs(hours)
+  const h = String(Math.floor(abs)).padStart(2, "0")
+  const m = String(Math.round((abs - Math.floor(abs)) * 60)).padStart(2, "0")
+  return `${sign}${h}:${m}`
+}
+
 // Parse a server-provided rate-limit reset timestamp from the response
 // body. Handles formats like:
-//   "Your limit will reset at 2026-06-16 01:42:26"
-//   "Rate limit will reset at 2026-06-16T01:42:26Z"
-//   "Retry after 2026-06-16T01:42:26+00:00"
-//   "Reset at 2026-06-16 01:42:26"
+//   "Your limit will reset at 2026-06-16 01:42:26"     (server-local, applies rateLimitTzOffsetHours)
+//   "Rate limit will reset at 2026-06-16T01:42:26Z"   (explicit UTC, offset ignored)
+//   "Retry after 2026-06-16T01:42:26+00:00"           (explicit offset, used as-is)
+//   "Reset at 2026-06-16 01:42:26"                    (server-local, applies rateLimitTzOffsetHours)
 // Returns the absolute timestamp in ms, or undefined if no recognizable
 // reset time was found.
 function parseResetTime(body: string | undefined): number | undefined {
@@ -59,12 +89,12 @@ function parseResetTime(body: string | undefined): number | undefined {
   )
   if (!match) return undefined
   // Normalize "YYYY-MM-DD HH:MM:SS" to "YYYY-MM-DDTHH:MM:SS" so
-  // `Date.parse` treats it as ISO. Append "Z" if no timezone was
-  // specified (assume UTC — most API providers report reset times in
-  // UTC; the user's local timezone is handled by `Date.parse`).
-  let ts = match[1].replace(" ", "T")
-  if (!match[2]) ts += "Z"
-  const parsed = Date.parse(ts)
+  // `Date.parse` treats it as ISO. Apply the configured server
+  // timezone offset when no explicit timezone is in the body; fall
+  // back to "Z" (UTC) for the default (most providers) case.
+  const tsBase = match[1].replace(" ", "T")
+  const tzSuffix = match[2] ?? (rateLimitTzOffsetHours === 0 ? "Z" : formatTzOffset(rateLimitTzOffsetHours))
+  const parsed = Date.parse(`${tsBase}${tzSuffix}`)
   if (Number.isNaN(parsed)) return undefined
   return parsed
 }
