@@ -28,6 +28,47 @@ export const RETRY_BACKOFF_FACTOR = 2
 export const RETRY_MAX_DELAY_NO_HEADERS = 30_000 // 30 seconds
 export const RETRY_MAX_DELAY = 2_147_483_647 // max 32-bit signed integer for setTimeout
 
+// Module-level clock skew (server time minus local time, in ms), populated
+// lazily from `Date` response headers. Used to convert server-provided
+// reset timestamps to local time so the wait duration is correct even
+// when the local clock is drifted from the server's. Initialized to 0
+// (no adjustment) until the first `Date` header is observed.
+let clockSkewMs = 0
+
+function observeClockSkew(headers: Record<string, string> | undefined) {
+  if (!headers) return
+  const dateHeader = headers["date"] ?? headers["Date"]
+  if (!dateHeader) return
+  const serverTime = Date.parse(dateHeader)
+  if (Number.isNaN(serverTime)) return
+  clockSkewMs = serverTime - Date.now()
+}
+
+// Parse a server-provided rate-limit reset timestamp from the response
+// body. Handles formats like:
+//   "Your limit will reset at 2026-06-16 01:42:26"
+//   "Rate limit will reset at 2026-06-16T01:42:26Z"
+//   "Retry after 2026-06-16T01:42:26+00:00"
+//   "Reset at 2026-06-16 01:42:26"
+// Returns the absolute timestamp in ms, or undefined if no recognizable
+// reset time was found.
+function parseResetTime(body: string | undefined): number | undefined {
+  if (!body) return undefined
+  const match = body.match(
+    /(?:limit\s+will\s+reset\s+at|resets?\s+at|retry\s+after|reset\s+at)\s*(\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2})(Z|[+-]\d{2}:?\d{2})?/i,
+  )
+  if (!match) return undefined
+  // Normalize "YYYY-MM-DD HH:MM:SS" to "YYYY-MM-DDTHH:MM:SS" so
+  // `Date.parse` treats it as ISO. Append "Z" if no timezone was
+  // specified (assume UTC — most API providers report reset times in
+  // UTC; the user's local timezone is handled by `Date.parse`).
+  let ts = match[1].replace(" ", "T")
+  if (!match[2]) ts += "Z"
+  const parsed = Date.parse(ts)
+  if (Number.isNaN(parsed)) return undefined
+  return parsed
+}
+
 function cap(ms: number) {
   return Math.min(ms, RETRY_MAX_DELAY)
 }
@@ -35,6 +76,7 @@ function cap(ms: number) {
 export function delay(attempt: number, error?: SessionV1.APIError) {
   if (error) {
     const headers = error.data.responseHeaders
+    observeClockSkew(headers)
     if (headers) {
       const retryAfterMs = headers["retry-after-ms"]
       if (retryAfterMs) {
@@ -57,9 +99,28 @@ export function delay(attempt: number, error?: SessionV1.APIError) {
           return cap(Math.ceil(parsed))
         }
       }
-
-      return cap(RETRY_INITIAL_DELAY * Math.pow(RETRY_BACKOFF_FACTOR, attempt - 1))
     }
+
+    // Fallback for providers that put the reset time in the response body
+    // rather than in `retry-after` headers (e.g. MiniMax-M3 returns
+    // "Usage limit reached. Your limit will reset at YYYY-MM-DD HH:MM:SS").
+    // Use the cached clock skew so the wait is accurate even when the
+    // local clock is drifted from the server's.
+    const body = error.data.responseBody
+    const resetTime = parseResetTime(body)
+    if (resetTime !== undefined) {
+      // resetTime is an absolute timestamp in the server's clock. The
+      // wait in local time is: (server's reset) - (local now + skew).
+      //   skew = serverTime - localTime
+      //   so localReset = serverReset - skew
+      //   localWait = localReset - localNow = serverReset - skew - localNow
+      const wait = Math.max(0, resetTime - Date.now() - clockSkewMs)
+      if (wait > 0) {
+        return cap(wait)
+      }
+    }
+
+    return cap(RETRY_INITIAL_DELAY * Math.pow(RETRY_BACKOFF_FACTOR, attempt - 1))
   }
 
   return cap(Math.min(RETRY_INITIAL_DELAY * Math.pow(RETRY_BACKOFF_FACTOR, attempt - 1), RETRY_MAX_DELAY_NO_HEADERS))
